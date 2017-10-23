@@ -25,6 +25,12 @@ library
                      , mysql-haskell
                      , io-streams
                      , text
+                     , text-format
+                     , text-show
+                     , http-conduit
+                     , http-types
+                     , split
+                     , hashmap
   default-language:    Haskell2010
 
 executable parse-exe
@@ -41,6 +47,11 @@ executable parse-exe
                      , mysql-haskell
                      , io-streams
                      , text
+                     , text-format
+                     , text-show
+                     , http-conduit
+                     , http-types
+                     , split
   default-language:    Haskell2010
 
 test-suite parse-test

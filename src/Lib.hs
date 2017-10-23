@@ -4,53 +4,20 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE DeriveGeneric #-}
 
-module Lib (a_createtable, a_tables, DataType(..), Col(..), Index(..), CreateTable(..)) where
+module Lib ( a_createtable, a_tables, a_shardconfig) where
 
+import Model
 import Text.Parsec.Prim
 import Text.Parsec.Combinator
 import Text.Parsec.Char
 import Data.Maybe
+import qualified Data.Text as DT
 import Data.Char as C
 import Data.Either
 import GHC.Generics
 import qualified Data.List as DL
-import Control.Applicative (Alternative(empty))
-
-
-data DataType = DataType
-  { t :: String
-  , len :: Maybe Int
-  , unsigned :: Bool
-  } deriving(Eq, Show, Generic)
-
-data Col = Col
-  { idNum :: Int
-  , name :: String
-  , dataType :: DataType
-  , pk :: Bool
-  , autoIncrement :: Bool
-  , null :: Bool
-  , defaultValue :: Maybe (Maybe String)
-  , updateDefaultValue :: Maybe String
-  , comment :: Maybe String
-  } deriving(Eq, Show, Generic)
-
-data Index = Index
-  { idNum :: Int
-  , name :: String
-  , columns :: [String]
-  , unique :: Bool
-  , pk :: Bool
-  , comment :: Maybe String
-  } deriving(Eq, Show, Generic)
-
-data CreateTable = CreateTable
-  { tableName :: String
-  , columns :: [Col]
-  , indices :: [Index]
-  } deriving(Eq, Show, Generic)
-
---createTable :: GenParser Char st CreateTable
+import qualified Control.Applicative as CA (Alternative(empty), (<|>))
+import Control.Monad
 
 qt :: (Stream s m Char) => Char -> Char -> ParsecT s u m a -> ParsecT s u m [a]
 qt l r p = char l *> manyTill p (char r)
@@ -59,7 +26,7 @@ str_qt :: Stream s m Char => ParsecT s u m a -> ParsecT s u m [a]
 str_qt p = char '"' *> manyTill p (char '"') <|> char '\'' *> manyTill p (char '\'')
 
 choice' :: Stream s m  Char => [ParsecT s u m a] -> ParsecT s u m a
-choice' = foldl (\r i -> r <|> try i) empty
+choice' = foldl (\r i -> r <|> try i) CA.empty
 
 qt_optional :: Stream s m Char => Char -> Char -> ParsecT s u m a -> ParsecT s u m [a]
 qt_optional l r p = (qt l r p) <|> manyTill p (lookAhead $ oneOf "\n,) ")
@@ -118,6 +85,12 @@ a_datetimetype = do
   optional $ try (qt '(' ')' digit)
   return $ DataType { t = "DATETIME", len = Nothing, unsigned = False }
 
+a_yeartype :: (Stream s m Char) => ParsecT s u m DataType
+a_yeartype = do
+  string "year" <|> string "YEAR"
+  optional $ try (qt '(' ')' digit)
+  return $ DataType { t = "YEAR", len = Nothing, unsigned = False }
+
 a_floattype :: (Stream s m Char) => String -> ParsecT s u m DataType
 a_floattype ts = do
   t <- string ts <|> string (lowerStr ts)
@@ -135,6 +108,11 @@ a_timestamptype = do
   string "TIMESTAMP" <|> string "timestamp"
   return $ DataType { t = "TIMESTAMP", len = Nothing, unsigned = False }
 
+a_timetype :: (Stream s m Char) => ParsecT s u m DataType
+a_timetype = do
+  string "TIME" <|> string "time"
+  return $ DataType { t = "TIME", len = Nothing, unsigned = False }
+
 a_dataType :: (Stream s m Char) => ParsecT s u m DataType
 a_dataType = choice' [ a_inttype "INT"
                     , a_inttype "BIGINT"
@@ -150,17 +128,22 @@ a_dataType = choice' [ a_inttype "INT"
                     , a_chartype "BINARY"
                     , a_chartype "VARBINARY"
                     , a_texttype "TEXT"
+                    , a_texttype "TINYTEXT"
                     , a_texttype "MEDIUMTEXT"
                     , a_texttype "LONGTEXT"
                     , a_blobtype "BLOB"
                     , a_blobtype "MEDIUMBLOB"
+                    , a_blobtype "LONGBLOB"
                     , a_enumtype
                     , a_datetimetype
                     , a_datetype
-                    , a_timestamptype]
+                    , a_timestamptype
+                    , a_timetype
+                    , a_yeartype]
 
 a_columnname :: (Stream s m Char) => ParsecT s u m String
-a_columnname =  notFollowedBy (pk_prefix <|> pindex_prefix) *> (qt_optional '`' '`' (alphaNum <|> char '_' <|> char ' '))
+a_columnname =  notFollowedBy (pk_prefix <|> pindex_prefix)
+  *> (qt_optional '`' '`' (alphaNum <|> char '_' <|> char ' '))
 
 a_nullable :: (Stream s m Char) => ParsecT s u m Bool
 a_nullable = do
@@ -210,12 +193,14 @@ a_column = do
   optional $ try a_charset
   optional $ try a_collate
   optional $ try (spaces *> string "zerofill")
-  nullable <- option True $ try a_nullable
+  nullable1 <- optionMaybe  $ try a_nullable
   defaultValue <-  optionMaybe $ try a_defaultvalue
   updateDefault <- optionMaybe $ try a_updatedefaultvalue
   pk <- option False $ try a_pk
   autoIncrement <- option False $ try a_autoincrement
+  nullable2 <- optionMaybe $ try a_nullable
   comment <- optionMaybe $ try a_comment
+  let nullable = maybe True Prelude.id $ nullable1 CA.<|> nullable2
   return $ Col { idNum = 2
                , name = name
                , dataType = dt
@@ -245,7 +230,7 @@ pindex_prefix = do
 a_plainindex :: Stream s m Char => ParsecT s u m (KeyType, String)
 a_plainindex = do
   kt <- pindex_prefix
-  name <- space *> qt '`' '`' (alphaNum <|> char '_' <|> char '+' <|> char '-')
+  name <- space *> qt '`' '`' (char ' ' <|> alphaNum <|> char '_' <|> char '+' <|> char '-' <|> char ',' <|> char '\b')
   return $ (kt, name)
 a_constraint :: Stream s m Char => ParsecT s u m ()
 a_constraint = do
@@ -276,11 +261,11 @@ a_createtable = do
   string "CREATE TABLE" <|> string "create table"
   space
   spaces
-  tablename <- qt '`' '`' (alphaNum <|> char '_')
+  tablename <- qt_optional '`' '`' (alphaNum <|> char '_' <|> char '.' <|> char '-')
   spaces
   (indices, cols) <- between (char '(') (char ')') $
          nl_space_around *> column_index_defs <* nl_space_around
-  manyTill anyChar (lookAhead $ char ';')
+  manyTill anyChar (eof <|> lookAhead (char ';' >> return ()))
   return $ CreateTable { tableName = tablename
                        , columns = setColIdNum cols
                        , indices = setIndexIdNum $ filter (\Index{..} -> name /= "__X__") indices }
@@ -294,4 +279,30 @@ a_createtable = do
     nl_space_around = spaces *> (optional $ symbol "\n") *> spaces
 
 a_tables :: Stream s m Char => ParsecT s u m [CreateTable]
-a_tables = a_createtable `endBy` (char ';' *> optional (char '\n'))
+a_tables = a_createtable `endBy` (eof <|> (char ';' *> optional (char '\n')))
+
+a_shard_type :: Stream s m Char => ParsecT s u m String
+a_shard_type = do
+  x <- choice [ string "no_string"
+              , string "long"
+              , string "string"]
+  return $ map toUpper x
+a_shard_slice :: Stream s m Char => ParsecT s u m (Maybe (Integer, Integer))
+a_shard_slice = do
+  (char ':' *> eof >> return Nothing) <|> (a_slice >>= return . Just)
+  where
+    a_slice = do
+      l <- many1 digit
+      char ':'
+      r <- many1 digit
+      return (read l, read r)
+
+a_shardconfig :: Stream s m Char => ParsecT s u m ShardConfig
+a_shardconfig = do
+  string "flat_" *> many digit *> (char '_')
+  column <- fmap DT.pack $ manyTill (alphaNum <|> char '_') (lookAhead . try $ char '_' *> a_shard_type)
+  char '_'
+  itype <- fmap DT.pack a_shard_type
+  slice' <- optionMaybe $ char '_' *> a_shard_slice
+  let slice = fmap (\(x, y) -> [x, y]) $ maybe Nothing Prelude.id slice'
+  return ShardConfig{..}
